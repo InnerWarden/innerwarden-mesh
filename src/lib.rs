@@ -11,4 +11,5 @@ pub mod peer;
 pub mod persistence;
 pub mod signal;
 pub mod staging;
+pub mod transport;
 pub mod validation;
