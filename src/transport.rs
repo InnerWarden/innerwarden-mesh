@@ -37,10 +37,10 @@ struct SignalResponse {
 /// Response for GET /mesh/ping
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct PingResponse {
-    node_id: String,
-    version: String,
-    uptime_secs: u64,
-    staged_count: usize,
+    pub node_id: String,
+    pub version: String,
+    pub uptime_secs: u64,
+    pub staged_count: usize,
 }
 
 /// Start the mesh peer-to-peer listener.

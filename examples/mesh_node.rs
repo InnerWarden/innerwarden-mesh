@@ -46,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
         auto_broadcast: true,
         max_signals_per_hour: 50,
         max_staged: 10_000,
+        initial_trust: 0.7, // test mode: trust config peers enough to stage signals
     };
 
     let mut node = MeshNode::new(config, std::path::Path::new(&data_dir))?;
@@ -58,8 +59,9 @@ async fn main() -> anyhow::Result<()> {
     let (addr, _handle) = node.start_listener().await?;
     tracing::info!(node = %node_name, addr = %addr, "listener active");
 
-    // Wait for peers to come up
+    // Wait for peers to come up, then discover their identities
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    node.discover_peers().await;
 
     // Main loop
     let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(10));

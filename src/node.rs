@@ -99,6 +99,49 @@ impl MeshNode {
         transport::start_server(self.server_state.clone(), &self.config.bind).await
     }
 
+    /// Discover peer identities by pinging their endpoints.
+    /// Resolves node_ids and sets initial trust for config-defined peers.
+    pub async fn discover_peers(&mut self) {
+        let initial_trust = self.config.initial_trust;
+        let mut resolved = Vec::new();
+
+        for peer in &self.peers {
+            info!(endpoint = %peer.endpoint, "mesh: pinging peer...");
+            match self.client.ping(peer).await {
+                Some(resp) => {
+                    info!(
+                        endpoint = %peer.endpoint,
+                        peer_node_id = &resp.node_id[..16.min(resp.node_id.len())],
+                        "mesh: peer discovered"
+                    );
+                    // Update peer with real node_id
+                    resolved.push(PeerInfo {
+                        node_id: resp.node_id.clone(),
+                        endpoint: peer.endpoint.clone(),
+                        label: peer.label.clone(),
+                        added_at: peer.added_at,
+                    });
+                    // Set initial trust for config-defined peers
+                    let mut reps = self.server_state.reputations.lock().unwrap();
+                    let rep = reps
+                        .entry(resp.node_id.clone())
+                        .or_insert_with(|| PeerReputation::new(resp.node_id));
+                    if rep.signals_sent == 0 {
+                        // Only set initial trust if no history yet
+                        rep.trust_score = initial_trust;
+                    }
+                }
+                None => {
+                    warn!(endpoint = %peer.endpoint, "mesh: peer unreachable");
+                    resolved.push(peer.clone()); // keep for retry later
+                }
+            }
+        }
+
+        self.peers = resolved;
+        info!(peers = self.peers.len(), "mesh: peer discovery complete");
+    }
+
     /// Broadcast a local block decision to all peers.
     pub async fn broadcast_local_block(
         &self,

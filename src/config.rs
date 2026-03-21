@@ -30,6 +30,12 @@ pub struct MeshConfig {
     /// Maximum entries in the staging pool (default: 10000)
     #[serde(default = "default_max_staged")]
     pub max_staged: usize,
+
+    /// Initial trust for peers defined in config (default: 0.5).
+    /// Pre-approved peers start with higher trust so their signals
+    /// are immediately actionable without needing confirmation history.
+    #[serde(default = "default_initial_trust")]
+    pub initial_trust: f32,
 }
 
 /// A peer entry in the config file.
@@ -37,7 +43,8 @@ pub struct MeshConfig {
 pub struct PeerEntry {
     /// HTTPS endpoint (e.g., "https://10.0.1.5:8790")
     pub endpoint: String,
-    /// Ed25519 public key hex (64 chars) — verifies this peer's identity
+    /// Ed25519 public key hex (64 chars) — verifies this peer's identity.
+    /// Leave empty to auto-discover via ping.
     pub public_key: String,
     /// Human-friendly label (optional)
     #[serde(default)]
@@ -54,6 +61,7 @@ impl Default for MeshConfig {
             auto_broadcast: true,
             max_signals_per_hour: default_max_signals_per_hour(),
             max_staged: default_max_staged(),
+            initial_trust: default_initial_trust(),
         }
     }
 }
@@ -72,6 +80,9 @@ fn default_max_signals_per_hour() -> usize {
 }
 fn default_max_staged() -> usize {
     10_000
+}
+fn default_initial_trust() -> f32 {
+    0.5
 }
 
 #[cfg(test)]
