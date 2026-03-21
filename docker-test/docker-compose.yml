@@ -1,0 +1,68 @@
+# Inner Warden Mesh — 3-node test network
+#
+# Usage:
+#   docker compose up --build
+#
+# Node A: simulates attacks, broadcasts to B and C
+# Node B: receives signals, blocks IPs
+# Node C: receives signals, blocks IPs
+#
+# Watch the logs: all three nodes should show signals propagating
+
+services:
+  node-a:
+    build:
+      context: ..
+      dockerfile: docker-test/Dockerfile
+    container_name: mesh-node-a
+    environment:
+      - MESH_BIND=0.0.0.0:8790
+      - MESH_DATA_DIR=/data
+      - MESH_NODE_NAME=node-a
+      - MESH_PEERS=http://mesh-node-b:8790,http://mesh-node-c:8790
+      - MESH_SIMULATE=1
+    volumes:
+      - node-a-data:/data
+    networks:
+      - mesh-net
+
+  node-b:
+    build:
+      context: ..
+      dockerfile: docker-test/Dockerfile
+    container_name: mesh-node-b
+    environment:
+      - MESH_BIND=0.0.0.0:8790
+      - MESH_DATA_DIR=/data
+      - MESH_NODE_NAME=node-b
+      - MESH_PEERS=http://mesh-node-a:8790,http://mesh-node-c:8790
+      - MESH_SIMULATE=0
+    volumes:
+      - node-b-data:/data
+    networks:
+      - mesh-net
+
+  node-c:
+    build:
+      context: ..
+      dockerfile: docker-test/Dockerfile
+    container_name: mesh-node-c
+    environment:
+      - MESH_BIND=0.0.0.0:8790
+      - MESH_DATA_DIR=/data
+      - MESH_NODE_NAME=node-c
+      - MESH_PEERS=http://mesh-node-a:8790,http://mesh-node-b:8790
+      - MESH_SIMULATE=0
+    volumes:
+      - node-c-data:/data
+    networks:
+      - mesh-net
+
+volumes:
+  node-a-data:
+  node-b-data:
+  node-c-data:
+
+networks:
+  mesh-net:
+    driver: bridge
