@@ -5,8 +5,10 @@
 //! action — everything goes through a staging pool with reputation-weighted
 //! scoring and TTL-based auto-reversal.
 
+pub mod config;
 pub mod crypto;
 pub mod peer;
+pub mod persistence;
 pub mod signal;
 pub mod staging;
 pub mod validation;
