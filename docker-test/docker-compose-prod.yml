@@ -1,0 +1,44 @@
+# Inner Warden Mesh — test nodes pointing at production server
+#
+# Node A: simulates attacks, broadcasts to production server
+# Node B: also connects to production server, receives signals
+#
+# Usage:
+#   docker compose -f docker-compose-prod.yml up --build
+
+services:
+  node-a:
+    build:
+      context: ..
+      dockerfile: docker-test/Dockerfile
+    container_name: mesh-test-attacker
+    environment:
+      - MESH_BIND=0.0.0.0:8790
+      - MESH_DATA_DIR=/data
+      - MESH_NODE_NAME=test-attacker
+      - MESH_PEERS=http://130.162.171.105:8790
+      - MESH_SIMULATE=1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - attacker-data:/data
+
+  node-b:
+    build:
+      context: ..
+      dockerfile: docker-test/Dockerfile
+    container_name: mesh-test-observer
+    environment:
+      - MESH_BIND=0.0.0.0:8790
+      - MESH_DATA_DIR=/data
+      - MESH_NODE_NAME=test-observer
+      - MESH_PEERS=http://130.162.171.105:8790
+      - MESH_SIMULATE=0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - observer-data:/data
+
+volumes:
+  attacker-data:
+  observer-data:
