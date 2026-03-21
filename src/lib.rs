@@ -7,9 +7,14 @@
 
 pub mod config;
 pub mod crypto;
+pub mod node;
 pub mod peer;
 pub mod persistence;
 pub mod signal;
 pub mod staging;
 pub mod transport;
 pub mod validation;
+
+// Re-export main types for convenience
+pub use config::MeshConfig;
+pub use node::{MeshNode, MeshTickResult, PeerSummary};
