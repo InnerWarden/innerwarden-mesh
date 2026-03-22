@@ -16,7 +16,7 @@ services:
       - MESH_BIND=0.0.0.0:8790
       - MESH_DATA_DIR=/data
       - MESH_NODE_NAME=test-attacker
-      - MESH_PEERS=http://130.162.171.105:8790
+      - MESH_PEERS=${MESH_PEER_URL}
       - MESH_SIMULATE=1
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -32,7 +32,7 @@ services:
       - MESH_BIND=0.0.0.0:8790
       - MESH_DATA_DIR=/data
       - MESH_NODE_NAME=test-observer
-      - MESH_PEERS=http://130.162.171.105:8790
+      - MESH_PEERS=${MESH_PEER_URL}
       - MESH_SIMULATE=0
     extra_hosts:
       - "host.docker.internal:host-gateway"
