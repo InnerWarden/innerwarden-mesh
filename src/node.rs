@@ -40,6 +40,8 @@ pub struct MeshNode {
     /// Tracks which IPs we've already told the agent to block
     /// (prevents re-emitting on every tick).
     notified_blocks: std::collections::HashSet<String>,
+    /// Last time we ran peer discovery (for periodic re-discovery).
+    last_discovery: chrono::DateTime<Utc>,
 }
 
 impl MeshNode {
@@ -91,6 +93,7 @@ impl MeshNode {
             config,
             data_dir: data_dir.to_path_buf(),
             notified_blocks: std::collections::HashSet::new(),
+            last_discovery: chrono::DateTime::<Utc>::MIN_UTC,
         })
     }
 
@@ -139,7 +142,31 @@ impl MeshNode {
         }
 
         self.peers = resolved;
+        self.last_discovery = Utc::now();
         info!(peers = self.peers.len(), "mesh: peer discovery complete");
+    }
+
+    /// Re-run discovery if enough time has passed or there are undiscovered peers.
+    /// Call this periodically (e.g., from the agent's slow loop).
+    pub async fn rediscover_if_needed(&mut self) {
+        let interval = chrono::Duration::seconds(self.config.poll_secs as i64 * 2);
+        if Utc::now() - self.last_discovery < interval {
+            return;
+        }
+
+        // Check if any peers still have empty node_ids (not yet discovered)
+        let undiscovered = self.peers.iter().any(|p| p.node_id.is_empty());
+        // Also re-discover if we have fewer active peers than configured
+        let fewer_than_config = self.peers.len() < self.config.peers.len();
+
+        if undiscovered || fewer_than_config {
+            info!(
+                undiscovered,
+                fewer_than_config,
+                "mesh: re-running peer discovery"
+            );
+            self.discover_peers().await;
+        }
     }
 
     /// Broadcast a local block decision to all peers.
