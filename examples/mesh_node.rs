@@ -71,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = tick_interval.tick() => {
+                node.rediscover_if_needed().await;
                 let result = node.tick();
                 tracing::info!(
                     node = %node_name,
