@@ -60,10 +60,12 @@ impl MeshNode {
             reputations.insert(rep.node_id.clone(), rep);
         }
 
-        // Merge config peers with persisted peers
+        // Merge config peers with persisted peers.
+        // Dedup by endpoint (not node_id) because config peers may have empty
+        // public_key — those get resolved later via discover_peers().
         let mut peers: Vec<PeerInfo> = state.peers;
         for pe in &config.peers {
-            if !peers.iter().any(|p| p.node_id == pe.public_key) {
+            if !peers.iter().any(|p| p.endpoint == pe.endpoint) {
                 peers.push(PeerInfo {
                     node_id: pe.public_key.clone(),
                     endpoint: pe.endpoint.clone(),
