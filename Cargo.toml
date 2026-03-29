@@ -2,7 +2,7 @@
 name = "innerwarden-mesh"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "BUSL-1.1"
 description = "Collaborative defense network for Inner Warden — game-theory-based threat signal sharing between nodes."
 repository = "https://github.com/InnerWarden/innerwarden-mesh"
 
