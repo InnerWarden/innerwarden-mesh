@@ -47,6 +47,33 @@ pub fn validate_signal(signal: &ThreatSignal) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// Validate an inbound suppression advisory (spec 062 Phase 6b).
+///
+/// Deliberately does NOT reject private / link-local IPs the way
+/// [`validate_signal`] does: the canonical suppression shape is noise on an
+/// internal or metadata IP (e.g. `imds_ssrf | 169.254.169.254`), so rejecting
+/// those would reject the entire feature. It still rejects an *unparseable* IP
+/// and an empty detector (a malformed advisory), enforces the same timestamp
+/// freshness window, and verifies the signature.
+pub fn validate_suppression(
+    signal: &crate::signal::SuppressionSignal,
+) -> Result<(), ValidationError> {
+    if signal.detector.trim().is_empty() || signal.ip.parse::<std::net::IpAddr>().is_err() {
+        return Err(ValidationError::PrivateIp); // reuse: "bad target shape"
+    }
+    let now = Utc::now();
+    if signal.timestamp > now + Duration::minutes(5) {
+        return Err(ValidationError::TimestampTooFarFuture);
+    }
+    if signal.timestamp < now - Duration::hours(1) {
+        return Err(ValidationError::TimestampTooOld);
+    }
+    if !signal.verify_signature() {
+        return Err(ValidationError::InvalidSignature);
+    }
+    Ok(())
+}
+
 /// Returns true if the IP is private, loopback, link-local, or reserved.
 pub fn is_private_ip(ip: &str) -> bool {
     let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
@@ -126,6 +153,49 @@ mod tests {
     #[test]
     fn accepts_valid_signal() {
         assert!(validate_signal(&valid_signal()).is_ok());
+    }
+
+    #[test]
+    fn validate_suppression_allows_link_local_but_rejects_garbage() {
+        use crate::signal::SuppressionSignal;
+        let id = NodeIdentity::generate();
+
+        // Link-local metadata IP is the canonical suppression shape — allowed.
+        let ok = SuppressionSignal::new(
+            &id,
+            "imds_ssrf".to_string(),
+            "169.254.169.254".to_string(),
+            1105,
+            3600,
+        );
+        assert!(validate_suppression(&ok).is_ok());
+
+        // Unparseable IP → rejected.
+        let bad_ip = SuppressionSignal::new(
+            &id,
+            "imds_ssrf".to_string(),
+            "not-an-ip".to_string(),
+            5,
+            3600,
+        );
+        assert_eq!(validate_suppression(&bad_ip), Err(ValidationError::PrivateIp));
+
+        // Empty detector → rejected.
+        let bad_det =
+            SuppressionSignal::new(&id, "  ".to_string(), "8.8.8.8".to_string(), 5, 3600);
+        assert_eq!(
+            validate_suppression(&bad_det),
+            Err(ValidationError::PrivateIp)
+        );
+
+        // Tampered signature → rejected.
+        let mut tampered =
+            SuppressionSignal::new(&id, "web_scan".to_string(), "8.8.8.8".to_string(), 5, 3600);
+        tampered.dismissals = 9999;
+        assert_eq!(
+            validate_suppression(&tampered),
+            Err(ValidationError::InvalidSignature)
+        );
     }
 
     #[test]

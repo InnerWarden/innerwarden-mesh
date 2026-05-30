@@ -17,4 +17,5 @@ pub mod validation;
 
 // Re-export main types for convenience
 pub use config::MeshConfig;
-pub use node::{MeshNode, MeshTickResult, PeerSummary};
+pub use node::{AdvisorySuppression, MeshNode, MeshTickResult, PeerSummary};
+pub use signal::{SuppressionSignal, ThreatSignal};

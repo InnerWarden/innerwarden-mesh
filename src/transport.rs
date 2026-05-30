@@ -9,12 +9,42 @@ use axum::{Json, Router};
 use chrono::Duration;
 use tracing::{info, warn};
 
+use chrono::{DateTime, Utc};
+
 use crate::config::MeshConfig;
 use crate::crypto::NodeIdentity;
 use crate::peer::{PeerInfo, PeerReputation};
-use crate::signal::ThreatSignal;
+use crate::signal::{SuppressionSignal, ThreatSignal};
 use crate::staging::{StagedAction, StagingPool};
 use crate::validation::{self, RateLimiter};
+
+/// Minimum sender trust before a suppression advisory is even recorded (spec
+/// 062 Phase 6b). Suppression fails dangerous, so the bar is the mesh's
+/// "blocked full" trust tier — a peer below this is ignored outright. The
+/// receiving agent then applies a SECOND gate (the shape must already be
+/// locally dismissed) before anything is suppressed.
+pub const MIN_ADVISORY_TRUST: f32 = 0.8;
+
+/// A suppression advisory accepted from a high-trust peer, awaiting the
+/// agent's advisory-only application. The mesh layer never acts on these
+/// itself — it only verifies, trust-scores, and hands them to the agent.
+#[derive(Debug, Clone)]
+pub struct ReceivedSuppression {
+    pub node_id: String,
+    pub detector: String,
+    pub ip: String,
+    pub dismissals: u64,
+    pub peer_trust: f32,
+    pub received_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl ReceivedSuppression {
+    /// The shape key: `detector|ip`.
+    pub fn shape(&self) -> String {
+        format!("{}|{}", self.detector, self.ip)
+    }
+}
 
 /// Shared state for the mesh HTTP server.
 pub struct MeshServerState {
@@ -22,6 +52,8 @@ pub struct MeshServerState {
     pub staging: Arc<Mutex<StagingPool>>,
     pub reputations: Arc<Mutex<HashMap<String, PeerReputation>>>,
     pub rate_limiter: Arc<Mutex<RateLimiter>>,
+    /// Inbox of accepted suppression advisories, drained by the agent each tick.
+    pub suppressions: Arc<Mutex<Vec<ReceivedSuppression>>>,
     pub config: MeshConfig,
 }
 
@@ -51,6 +83,7 @@ pub async fn start_server(
 ) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let app = Router::new()
         .route("/mesh/signal", post(handle_signal))
+        .route("/mesh/suppression", post(handle_suppression))
         .route("/mesh/ping", get(handle_ping))
         .with_state(state);
 
@@ -163,6 +196,120 @@ async fn handle_signal(
     )
 }
 
+/// POST /mesh/suppression — receive a suppression advisory from a peer.
+///
+/// Spec 062 Phase 6b. Verifies the signature, rate-limits, and trust-gates the
+/// sender at [`MIN_ADVISORY_TRUST`]. An accepted advisory is parked in the
+/// `suppressions` inbox for the agent to apply under its OWN second gate (the
+/// shape must already be locally dismissed). This handler NEVER suppresses
+/// anything — it cannot, it has no view of local dismissal history.
+async fn handle_suppression(
+    State(state): State<Arc<MeshServerState>>,
+    Json(signal): Json<SuppressionSignal>,
+) -> (StatusCode, Json<SignalResponse>) {
+    if let Err(e) = validation::validate_suppression(&signal) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SignalResponse {
+                accepted: false,
+                action: "rejected".to_string(),
+                error: Some(format!("{e:?}")),
+            }),
+        );
+    }
+
+    // Rate limit (shares the per-peer window with threat signals).
+    {
+        let mut rl = state.rate_limiter.lock().unwrap();
+        if !rl.check(&signal.node_id) {
+            let mut reps = state.reputations.lock().unwrap();
+            let rep = reps
+                .entry(signal.node_id.clone())
+                .or_insert_with(|| PeerReputation::new(signal.node_id.clone()));
+            rep.quarantine(Duration::hours(1));
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(SignalResponse {
+                    accepted: false,
+                    action: "quarantined".to_string(),
+                    error: Some("rate limit exceeded".to_string()),
+                }),
+            );
+        }
+    }
+
+    let reputation = {
+        let mut reps = state.reputations.lock().unwrap();
+        let rep = reps
+            .entry(signal.node_id.clone())
+            .or_insert_with(|| PeerReputation::new(signal.node_id.clone()));
+        rep.record_signal();
+        rep.clone()
+    };
+
+    if reputation.is_quarantined() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(SignalResponse {
+                accepted: false,
+                action: "quarantined".to_string(),
+                error: Some("peer is quarantined".to_string()),
+            }),
+        );
+    }
+
+    // Trust gate: suppression fails dangerous, so only high-trust peers are
+    // even recorded. A low-trust peer's advisory is dropped, NOT staged.
+    if reputation.trust_score < MIN_ADVISORY_TRUST {
+        info!(
+            peer = %signal.node_id,
+            shape = %signal.shape(),
+            trust = reputation.trust_score,
+            "mesh: suppression advisory ignored — sender below advisory trust floor"
+        );
+        return (
+            StatusCode::OK,
+            Json(SignalResponse {
+                accepted: false,
+                action: "low_trust_ignored".to_string(),
+                error: None,
+            }),
+        );
+    }
+
+    let now = Utc::now();
+    let ttl = signal.ttl_secs.min(7 * 24 * 3600); // cap advisory life at 7 days
+    {
+        let mut inbox = state.suppressions.lock().unwrap();
+        inbox.push(ReceivedSuppression {
+            node_id: signal.node_id.clone(),
+            detector: signal.detector.clone(),
+            ip: signal.ip.clone(),
+            dismissals: signal.dismissals,
+            peer_trust: reputation.trust_score,
+            received_at: now,
+            expires_at: now + Duration::seconds(ttl as i64),
+        });
+    }
+
+    info!(
+        peer = %signal.node_id,
+        shape = %signal.shape(),
+        dismissals = signal.dismissals,
+        trust = reputation.trust_score,
+        "mesh: suppression advisory accepted (advisory-only; agent applies local gate)"
+    );
+
+    (
+        StatusCode::OK,
+        Json(SignalResponse {
+            accepted: true,
+            action: "advisory_recorded".to_string(),
+            error: None,
+        }),
+    )
+}
+
 /// GET /mesh/ping — health check and identity exchange.
 async fn handle_ping(State(state): State<Arc<MeshServerState>>) -> Json<PingResponse> {
     let staged_count = state.staging.lock().unwrap().len();
@@ -213,6 +360,18 @@ impl MeshClient {
         }
     }
 
+    /// Send a suppression advisory to a peer. Returns true if accepted.
+    pub async fn send_suppression(&self, peer: &PeerInfo, signal: &SuppressionSignal) -> bool {
+        let url = format!("{}/mesh/suppression", peer.endpoint);
+        match self.http.post(&url).json(signal).send().await {
+            Ok(resp) => resp.status().is_success(),
+            Err(e) => {
+                warn!(peer = %peer.node_id, error = %e, "mesh: failed to send suppression");
+                false
+            }
+        }
+    }
+
     /// Ping a peer to check if it's alive.
     pub async fn ping(&self, peer: &PeerInfo) -> Option<PingResponse> {
         let url = format!("{}/mesh/ping", peer.endpoint);
@@ -233,6 +392,7 @@ mod tests {
             staging: Arc::new(Mutex::new(StagingPool::new(1000))),
             reputations: Arc::new(Mutex::new(HashMap::new())),
             rate_limiter: Arc::new(Mutex::new(RateLimiter::new(50))),
+            suppressions: Arc::new(Mutex::new(Vec::new())),
             config: MeshConfig::default(),
         })
     }
@@ -302,6 +462,122 @@ mod tests {
         let resp = reqwest::Client::new()
             .post(&url)
             .json(&signal)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // --- Suppression advisories (spec 062 Phase 6b) ---
+
+    fn high_trust_peer(state: &Arc<MeshServerState>, node_id: &str) {
+        let mut reps = state.reputations.lock().unwrap();
+        let mut rep = PeerReputation::new(node_id.to_string());
+        rep.trust_score = 0.9;
+        reps.insert(node_id.to_string(), rep);
+    }
+
+    #[tokio::test]
+    async fn suppression_accepted_from_high_trust_peer() {
+        let state = test_server_state();
+        let sender = NodeIdentity::generate();
+        high_trust_peer(&state, &sender.node_id);
+        let (addr, _h) = start_server(state.clone(), "127.0.0.1:0").await.unwrap();
+
+        let sig = SuppressionSignal::new(
+            &sender,
+            "web_scan".to_string(),
+            "8.8.8.8".to_string(),
+            12,
+            3600,
+        );
+        let client = MeshClient::new();
+        let peer = PeerInfo {
+            node_id: state.identity.node_id.clone(),
+            endpoint: format!("http://{addr}"),
+            label: None,
+            added_at: chrono::Utc::now(),
+        };
+        assert!(client.send_suppression(&peer, &sig).await);
+        let inbox = state.suppressions.lock().unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].shape(), "web_scan|8.8.8.8");
+    }
+
+    #[tokio::test]
+    async fn suppression_ignored_from_low_trust_peer() {
+        // No reputation seeded → fresh peer is below MIN_ADVISORY_TRUST.
+        let state = test_server_state();
+        let (addr, _h) = start_server(state.clone(), "127.0.0.1:0").await.unwrap();
+
+        let sender = NodeIdentity::generate();
+        let sig = SuppressionSignal::new(
+            &sender,
+            "web_scan".to_string(),
+            "8.8.8.8".to_string(),
+            12,
+            3600,
+        );
+        let url = format!("http://{addr}/mesh/suppression");
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .json(&sig)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["action"], "low_trust_ignored");
+        assert_eq!(body["accepted"], false);
+        // Nothing recorded — a low-trust peer cannot teach this node to ignore.
+        assert_eq!(state.suppressions.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn suppression_allows_link_local_metadata_ip() {
+        // The canonical case: imds_ssrf | 169.254.169.254. validate_signal
+        // would reject link-local; validate_suppression must NOT.
+        let state = test_server_state();
+        let sender = NodeIdentity::generate();
+        high_trust_peer(&state, &sender.node_id);
+        let (addr, _h) = start_server(state.clone(), "127.0.0.1:0").await.unwrap();
+
+        let sig = SuppressionSignal::new(
+            &sender,
+            "imds_ssrf".to_string(),
+            "169.254.169.254".to_string(),
+            1105,
+            86_400,
+        );
+        let client = MeshClient::new();
+        let peer = PeerInfo {
+            node_id: state.identity.node_id.clone(),
+            endpoint: format!("http://{addr}"),
+            label: None,
+            added_at: chrono::Utc::now(),
+        };
+        assert!(client.send_suppression(&peer, &sig).await);
+        assert_eq!(state.suppressions.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn suppression_rejects_tampered_signature() {
+        let state = test_server_state();
+        let (addr, _h) = start_server(state, "127.0.0.1:0").await.unwrap();
+
+        let sender = NodeIdentity::generate();
+        let mut sig = SuppressionSignal::new(
+            &sender,
+            "web_scan".to_string(),
+            "8.8.8.8".to_string(),
+            12,
+            3600,
+        );
+        sig.dismissals = 999_999; // tamper after signing
+        let url = format!("http://{addr}/mesh/suppression");
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .json(&sig)
             .send()
             .await
             .unwrap();
