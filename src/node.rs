@@ -28,6 +28,25 @@ pub struct MeshTickResult {
     pub contradicted_peers: Vec<(String, Vec<String>)>,
 }
 
+/// A live suppression advisory handed to the agent (spec 062 Phase 6b). The
+/// agent applies it ONLY as corroboration for a shape it already dismisses
+/// locally — never as an independent trigger.
+#[derive(Debug, Clone)]
+pub struct AdvisorySuppression {
+    pub node_id: String,
+    pub detector: String,
+    pub ip: String,
+    pub dismissals: u64,
+    pub peer_trust: f32,
+}
+
+impl AdvisorySuppression {
+    /// The shape key: `detector|ip`.
+    pub fn shape(&self) -> String {
+        format!("{}|{}", self.detector, self.ip)
+    }
+}
+
 /// The main mesh node — assembles all components.
 /// Created by the agent, stored in AgentState.
 pub struct MeshNode {
@@ -84,6 +103,7 @@ impl MeshNode {
             staging: Arc::new(Mutex::new(staging)),
             reputations: Arc::new(Mutex::new(reputations)),
             rate_limiter: Arc::new(Mutex::new(RateLimiter::new(config.max_signals_per_hour))),
+            suppressions: Arc::new(Mutex::new(Vec::new())),
             config: config.clone(),
         });
 
@@ -210,6 +230,66 @@ impl MeshNode {
             peers_total = self.peers.len(),
             "mesh: broadcast local block"
         );
+    }
+
+    /// Broadcast a local learned-suppression to all peers (spec 062 Phase 6b).
+    ///
+    /// Advisory only: peers record it but never auto-suppress on it — see
+    /// [`crate::signal::SuppressionSignal`]. Reuses `auto_broadcast` so an
+    /// operator who disabled outbound block signals also stays silent here.
+    pub async fn broadcast_local_suppression(
+        &self,
+        detector: &str,
+        ip: &str,
+        dismissals: u64,
+        ttl_secs: u64,
+    ) {
+        if !self.config.auto_broadcast {
+            return;
+        }
+        let signal = crate::signal::SuppressionSignal::new(
+            &self.identity,
+            detector.to_string(),
+            ip.to_string(),
+            dismissals,
+            ttl_secs,
+        );
+        let mut sent = 0;
+        for peer in &self.peers {
+            if self.client.send_suppression(peer, &signal).await {
+                sent += 1;
+            }
+        }
+        info!(
+            detector,
+            ip,
+            dismissals,
+            peers_notified = sent,
+            peers_total = self.peers.len(),
+            "mesh: broadcast local suppression (advisory)"
+        );
+    }
+
+    /// Drain the suppression-advisory inbox, dropping any that have expired.
+    /// Returns the live advisories for the agent to apply under its OWN gate
+    /// (the shape must already be locally dismissed). The mesh layer never
+    /// suppresses anything itself.
+    pub fn drain_advisory_suppressions(&mut self) -> Vec<AdvisorySuppression> {
+        let now = Utc::now();
+        let mut inbox = self.server_state.suppressions.lock().unwrap();
+        let drained: Vec<AdvisorySuppression> = inbox
+            .iter()
+            .filter(|s| s.expires_at > now)
+            .map(|s| AdvisorySuppression {
+                node_id: s.node_id.clone(),
+                detector: s.detector.clone(),
+                ip: s.ip.clone(),
+                dismissals: s.dismissals,
+                peer_trust: s.peer_trust,
+            })
+            .collect();
+        inbox.clear();
+        drained
     }
 
     /// Called by agent on each slow-loop tick.
@@ -380,6 +460,44 @@ mod tests {
         assert!(!node.node_id().is_empty());
         assert_eq!(node.peer_count(), 0);
         assert_eq!(node.staged_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_advisory_suppressions_drops_expired_and_clears_inbox() {
+        use crate::transport::ReceivedSuppression;
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = MeshNode::new(MeshConfig::default(), dir.path()).unwrap();
+        let now = Utc::now();
+        {
+            let mut inbox = node.server_state.suppressions.lock().unwrap();
+            // live
+            inbox.push(ReceivedSuppression {
+                node_id: "peer-a".into(),
+                detector: "web_scan".into(),
+                ip: "8.8.8.8".into(),
+                dismissals: 9,
+                peer_trust: 0.9,
+                received_at: now,
+                expires_at: now + chrono::Duration::hours(1),
+            });
+            // expired
+            inbox.push(ReceivedSuppression {
+                node_id: "peer-b".into(),
+                detector: "nmap_scan".into(),
+                ip: "9.9.9.9".into(),
+                dismissals: 3,
+                peer_trust: 0.85,
+                received_at: now - chrono::Duration::hours(2),
+                expires_at: now - chrono::Duration::hours(1),
+            });
+        }
+        let live = node.drain_advisory_suppressions();
+        assert_eq!(live.len(), 1, "expired advisory must be dropped");
+        assert_eq!(live[0].shape(), "web_scan|8.8.8.8");
+        // Inbox is drained either way.
+        assert_eq!(node.server_state.suppressions.lock().unwrap().len(), 0);
+        // Second drain is empty.
+        assert!(node.drain_advisory_suppressions().is_empty());
     }
 
     #[tokio::test]
