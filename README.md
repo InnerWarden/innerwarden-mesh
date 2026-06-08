@@ -1,6 +1,6 @@
 # Inner Warden Mesh
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE)
 
 **Attack one node, protect all others.**
 
@@ -79,7 +79,7 @@ innerwarden-mesh/
 ## Testing
 
 ```bash
-cargo test              # 49 unit + integration tests
+cargo test              # 59 unit + integration tests
 
 # Docker 3-node simulation:
 cd docker-test
@@ -88,4 +88,4 @@ docker compose up --build
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+BUSL-1.1 (Business Source License 1.1). See [LICENSE](LICENSE).
