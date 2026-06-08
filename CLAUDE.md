@@ -1,6 +1,6 @@
 # innerwarden-mesh — Collaborative Defense Network
 
-Game-theory trust model for sharing threat signals between nodes. Attack one node, protect all others. MIT licensed (open source).
+Game-theory trust model for sharing threat signals between nodes. Attack one node, protect all others. BUSL-1.1 licensed (Business Source License 1.1).
 
 ## Library crate
 
@@ -44,7 +44,7 @@ New peers: initial_trust = 0.5 (config) or 0.7 (test mode).
 ## Testing
 
 ```bash
-cargo test                    # 49 unit + integration tests
+cargo test                    # 59 unit + integration tests
 cd docker-test && docker compose up --build   # 3-node simulation
 ```
 
