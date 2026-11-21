@@ -76,7 +76,7 @@ impl MeshServerState {
 /// with.
 fn refuse_unknown_peer(node_id: &str) -> (StatusCode, Json<SignalResponse>) {
     warn!(
-        peer = &node_id[..16.min(node_id.len())],
+        peer = %NodeIdentity::short_id(node_id),
         "mesh: refused a message from a node id no configured peer has"
     );
     (
@@ -122,7 +122,15 @@ pub async fn start_server(
         .route("/mesh/suppression", post(handle_suppression))
         .route("/mesh/ping", get(handle_ping))
         .with_state(state);
+    serve(app, bind, tls).await
+}
 
+/// Serve `app` on `bind`: over TLS, or plain HTTP on a loopback address only.
+async fn serve(
+    app: Router,
+    bind: &str,
+    tls: Option<Arc<rustls::ServerConfig>>,
+) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let addr = listener.local_addr()?;
     let Some(tls) = tls else {
@@ -675,6 +683,75 @@ mod tests {
             client
                 .send_signal(&peer, &signal_from(&sender, "1.2.3.4"))
                 .await
+        );
+    }
+
+    /// FAILS ON REVERT (a byte slice of the id for the log line): the
+    /// handler panics and the peer gets no answer.
+    #[tokio::test]
+    async fn an_unknown_node_id_with_a_multibyte_character_is_refused_not_a_panic() {
+        // The log line's fields are read only when a subscriber listens, as
+        // on every agent. One for this thread (the test runtime's only one).
+        let _log =
+            tracing::subscriber::set_default(tracing_subscriber::fmt().with_test_writer().finish());
+        let state = test_server_state(&[]);
+        let (addr, _h) = start_server(state, "127.0.0.1:0", None).await.unwrap();
+        // A character straddling byte 16: a byte slice there panics the handler.
+        let mut signal = signal_from(&NodeIdentity::generate(), "5.6.7.8");
+        signal.node_id = format!("{}\u{e9}{}", "a".repeat(15), "b".repeat(47));
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/mesh/signal"))
+            .json(&signal)
+            .send()
+            .await
+            .expect("the handler answered");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// FAILS ON REVERT (reqwest's default policy follows up to 10 redirects
+    /// with no scheme check): a pinned peer that answers with a redirect to
+    /// `http://` has the request sent there in clear.
+    #[tokio::test]
+    async fn a_peer_s_redirect_is_never_followed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let plain_hits = hits.clone();
+        let plain = Router::new().route(
+            "/mesh/ping",
+            get(move || {
+                plain_hits.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Json(serde_json::json!({
+                        "node_id": "a".repeat(64),
+                        "version": "x",
+                        "uptime_secs": 0,
+                        "staged_count": 0
+                    }))
+                }
+            }),
+        );
+        let (plain_addr, _p) = serve(plain, "127.0.0.1:0", None).await.unwrap();
+        let to = format!("http://{plain_addr}/mesh/ping");
+        let redirecting = Router::new().route(
+            "/mesh/ping",
+            get(move || async move {
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [(axum::http::header::LOCATION, to)],
+                )
+            }),
+        );
+        let (config, sha) = testing::leaf(&["127.0.0.1"], None);
+        let (addr, _h) = serve(redirecting, "127.0.0.1:0", Some(config))
+            .await
+            .unwrap();
+
+        let (client, peer) = client_for(peer_entry(addr, Some(sha), None));
+        assert!(client.ping(&peer).await.is_none(), "followed the redirect");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the plain listener was contacted"
         );
     }
 

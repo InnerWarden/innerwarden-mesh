@@ -1,10 +1,9 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::Serialize;
 
 use crate::peer::{PeerInfo, PeerReputation};
-use crate::staging::StagedSignal;
 
 /// Mesh state that gets persisted to disk between restarts.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]

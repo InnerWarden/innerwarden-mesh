@@ -12,7 +12,7 @@ use crate::crypto::NodeIdentity;
 use crate::peer::{PeerInfo, PeerReputation};
 use crate::persistence;
 use crate::signal::ThreatSignal;
-use crate::staging::{StagedAction, StagingPool};
+use crate::staging::StagingPool;
 use crate::transport::{self, MeshClient, MeshServerState};
 use crate::validation::RateLimiter;
 
@@ -127,7 +127,7 @@ impl MeshNode {
         }
 
         // Restore staging pool
-        let mut staging = StagingPool::new(config.max_staged);
+        let staging = StagingPool::new(config.max_staged);
         // TODO: restore staged entries from persistence
 
         let server_state = Arc::new(MeshServerState {
@@ -182,7 +182,7 @@ impl MeshNode {
                 Some(resp) if !peer.node_id.is_empty() && resp.node_id != peer.node_id => {
                     warn!(
                         endpoint = %peer.endpoint,
-                        answered = &resp.node_id[..16.min(resp.node_id.len())],
+                        answered = %NodeIdentity::short_id(&resp.node_id),
                         "mesh: peer answered with a node id other than its configured public_key; \
                          only the configured key is accepted"
                     );
@@ -195,7 +195,7 @@ impl MeshNode {
                 Some(resp) => {
                     info!(
                         endpoint = %peer.endpoint,
-                        peer_node_id = &resp.node_id[..16.min(resp.node_id.len())],
+                        peer_node_id = %NodeIdentity::short_id(&resp.node_id),
                         "mesh: peer discovered"
                     );
                     // Read over the peer's checked certificate: this id is

@@ -178,11 +178,13 @@ mod tests {
             5,
             3600,
         );
-        assert_eq!(validate_suppression(&bad_ip), Err(ValidationError::PrivateIp));
+        assert_eq!(
+            validate_suppression(&bad_ip),
+            Err(ValidationError::PrivateIp)
+        );
 
         // Empty detector → rejected.
-        let bad_det =
-            SuppressionSignal::new(&id, "  ".to_string(), "8.8.8.8".to_string(), 5, 3600);
+        let bad_det = SuppressionSignal::new(&id, "  ".to_string(), "8.8.8.8".to_string(), 5, 3600);
         assert_eq!(
             validate_suppression(&bad_det),
             Err(ValidationError::PrivateIp)
@@ -209,10 +211,7 @@ mod tests {
             b"e",
             3600,
         );
-        assert_eq!(
-            validate_signal(&signal),
-            Err(ValidationError::PrivateIp)
-        );
+        assert_eq!(validate_signal(&signal), Err(ValidationError::PrivateIp));
     }
 
     #[test]
@@ -226,16 +225,13 @@ mod tests {
             b"e",
             3600,
         );
-        assert_eq!(
-            validate_signal(&signal),
-            Err(ValidationError::PrivateIp)
-        );
+        assert_eq!(validate_signal(&signal), Err(ValidationError::PrivateIp));
     }
 
     #[test]
     fn rejects_invalid_confidence() {
         let id = NodeIdentity::generate();
-        let mut signal = ThreatSignal::new(
+        let signal = ThreatSignal::new(
             &id,
             "1.2.3.4".to_string(),
             "test".to_string(),

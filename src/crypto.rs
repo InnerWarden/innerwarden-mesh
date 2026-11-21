@@ -48,9 +48,16 @@ impl NodeIdentity {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            std::fs::write(path, identity.keypair.as_bytes()).context("writing mesh identity")?;
+            write_private(path, identity.keypair.as_bytes()).context("writing mesh identity")?;
             Ok(identity)
         }
+    }
+
+    /// PURE. The first 16 characters of a node id, for a log line. By
+    /// character, never by byte: an id off the network may hold a
+    /// multi-byte character where a byte slice would split it and panic.
+    pub fn short_id(text: &str) -> String {
+        text.chars().take(16).collect()
     }
 
     /// PURE. Is `text` a node id: an Ed25519 public key, 64 hex digits.
@@ -123,6 +130,21 @@ mod hex {
     }
 }
 
+/// Create `path` with `bytes`, readable by its owner only (0600 from the
+/// start, never widened by the umask first), never over an existing file.
+/// The signing seed: whoever reads it signs signals as this node.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +162,32 @@ mod tests {
             &id.node_id[4..]
         )));
         assert!(!NodeIdentity::verify("a\u{e9}a0", b"m", "sig"));
+        // The log form cuts by character: a byte cut at 16 would split \u{e9}.
+        let odd = format!("{}\u{e9}{}", "a".repeat(15), "b".repeat(8));
+        assert_eq!(
+            NodeIdentity::short_id(&odd),
+            format!("{}\u{e9}", "a".repeat(15))
+        );
+        assert_eq!(NodeIdentity::short_id("abc"), "abc");
+    }
+
+    /// FAILS ON REVERT (`std::fs::write`): the seed is created 0644 under the
+    /// usual umask, readable by every local account that reaches the data
+    /// directory, and any of them signs signals as this node.
+    #[cfg(unix)]
+    #[test]
+    fn the_identity_seed_is_its_owners_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mesh-identity.key");
+        let made = NodeIdentity::load_or_create(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // Loaded again, the same node.
+        assert_eq!(
+            NodeIdentity::load_or_create(&path).unwrap().node_id,
+            made.node_id
+        );
     }
 
     #[test]

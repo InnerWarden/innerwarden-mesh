@@ -213,6 +213,9 @@ pub fn peer_client(entry: &PeerEntry, timeout: std::time::Duration) -> Result<re
     };
     reqwest::Client::builder()
         .timeout(timeout)
+        // A redirect is never followed: the next hop could be http:// (the
+        // signal in clear) or another host, past the certificate checked here.
+        .redirect(reqwest::redirect::Policy::none())
         .use_preconfigured_tls(config)
         .build()
         .context("building the peer's HTTPS client")
