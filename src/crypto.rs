@@ -48,10 +48,20 @@ impl NodeIdentity {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            std::fs::write(path, identity.keypair.as_bytes())
-                .context("writing mesh identity")?;
+            std::fs::write(path, identity.keypair.as_bytes()).context("writing mesh identity")?;
             Ok(identity)
         }
+    }
+
+    /// PURE. Is `text` a node id: an Ed25519 public key, 64 hex digits.
+    pub fn is_node_id(text: &str) -> bool {
+        let Ok(bytes) = hex::decode(text) else {
+            return false;
+        };
+        let Ok(array) = <[u8; 32]>::try_from(bytes) else {
+            return false;
+        };
+        VerifyingKey::from_bytes(&array).is_ok()
     }
 
     /// Sign a canonical message. Returns base64-encoded signature.
@@ -101,7 +111,9 @@ mod hex {
     }
 
     pub fn decode(s: &str) -> Result<Vec<u8>, ()> {
-        if s.len() % 2 != 0 {
+        // A node id comes off the network: a multi-byte character would put
+        // a slice below in the middle of it, and that panics.
+        if !s.len().is_multiple_of(2) || !s.is_ascii() {
             return Err(());
         }
         (0..s.len())
@@ -114,6 +126,21 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_node_id_is_an_ed25519_key_in_hex_and_never_panics() {
+        let id = NodeIdentity::generate();
+        assert!(NodeIdentity::is_node_id(&id.node_id));
+        assert!(!NodeIdentity::is_node_id(""));
+        assert!(!NodeIdentity::is_node_id(&"zz".repeat(32)));
+        assert!(!NodeIdentity::is_node_id(&id.node_id[..62]));
+        // Multi-byte characters: slicing by byte would panic.
+        assert!(!NodeIdentity::is_node_id(&format!(
+            "a\u{e9}a{}",
+            &id.node_id[4..]
+        )));
+        assert!(!NodeIdentity::verify("a\u{e9}a0", b"m", "sig"));
+    }
 
     #[test]
     fn sign_verify_roundtrip() {
@@ -141,7 +168,11 @@ mod tests {
     #[test]
     fn reject_invalid_signature() {
         let identity = NodeIdentity::generate();
-        assert!(!NodeIdentity::verify(&identity.node_id, b"msg", "not-valid-base64!!!"));
+        assert!(!NodeIdentity::verify(
+            &identity.node_id,
+            b"msg",
+            "not-valid-base64!!!"
+        ));
     }
 
     #[test]

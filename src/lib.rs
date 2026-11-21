@@ -12,6 +12,7 @@ pub mod peer;
 pub mod persistence;
 pub mod signal;
 pub mod staging;
+pub mod tls;
 pub mod transport;
 pub mod validation;
 

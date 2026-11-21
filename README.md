@@ -45,6 +45,15 @@ A malicious peer cannot build trust cheaply. Three confirmed signals to offset o
 
 ## Security
 
+- **Checked TLS to every peer**: each configured peer names the SHA-256 of
+  its certificate (`tls_cert_sha256`) or a CA file (`tls_ca`); a peer with
+  neither, or a plain `http://` endpoint, is refused and never contacted. The
+  listener serves TLS with `tls_cert`/`tls_key`, or with a self-signed pair the
+  node makes once in its data directory (its digest is logged at start).
+- **Configured node ids only**: a signal or advisory signed by a node id that
+  is not a configured peer's `public_key` (or the id that peer answered its
+  ping with, over its checked certificate) is refused before anything is
+  recorded about it
 - **Ed25519 signatures** on every signal — tamper-proof, peer-authenticated
 - **RFC1918 rejection** — private IPs never accepted as threats
 - **Rate limiter + circuit breaker** — flood protection per peer
@@ -56,7 +65,7 @@ A malicious peer cannot build trust cheaply. Three confirmed signals to offset o
 ```bash
 # On each server running Inner Warden:
 innerwarden mesh enable
-innerwarden mesh add-peer https://other-server:8790
+innerwarden-ctl mesh add-peer https://other-server:8790 --cert-sha256 <the other server's digest>
 sudo systemctl restart innerwarden-agent
 ```
 

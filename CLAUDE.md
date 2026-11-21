@@ -62,14 +62,19 @@ auto_broadcast = true
 
 [[mesh.peers]]
 endpoint = "https://peer1:8790"
-public_key = ""
+public_key = ""            # empty: learned from the peer's ping over its checked certificate
+tls_cert_sha256 = "AB:CD:..." # or tls_ca = "/path/ca.pem"; neither = peer refused
 label = "prod-eu"
 ```
+
+TLS (`src/tls.rs`): the client never accepts an unchecked certificate; the
+listener serves TLS (`tls_cert`/`tls_key` in `[mesh]`, or the generated
+`mesh-tls-cert.pem`/`mesh-tls-key.pem`); plain HTTP only on loopback. The
+server takes signals only from configured node ids (`known_peers`).
 
 Agent wrapper: `crates/agent/src/mesh.rs` (delegates to MeshNode).
 
 ## Known issues (2026-03-27)
 
 - Peer re-discovery added (`rediscover_if_needed`) but not yet tested in multi-node production setup
-- Transport rejects signals from completely unknown peers (no trust entry) — may need a "first-contact" trust level
-- Agent config requires `public_key = ""` for each peer (empty string, discovered via ping)
+- `docker-test/` still lists `http://` peers: those are refused now; it needs a CA (`MESH_TLS_CA`) or per-peer digests (`endpoint@sha256` in `MESH_PEERS`, see `examples/mesh_node.rs`)
