@@ -89,10 +89,14 @@ impl MeshNode {
         for r in &refused {
             warn!(endpoint = %r.endpoint, reason = %r.reason, "mesh: peer refused, never contacted");
         }
+        // Only the first entry for an endpoint counts, as in `for_peers`: its
+        // pin is the one the client checks, so its key is the one taken. A
+        // later entry never stands in, not even when the first is refused.
         let mut peers: Vec<PeerInfo> = Vec::new();
         let mut known_peers: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<&str> = HashSet::new();
         for pe in &config.peers {
-            if !client.contacts(&pe.endpoint) || peers.iter().any(|p| p.endpoint == pe.endpoint) {
+            if !seen.insert(pe.endpoint.as_str()) || !client.contacts(&pe.endpoint) {
                 continue;
             }
             let key = pe.public_key.trim();
@@ -691,6 +695,46 @@ mod tests {
             "took the id the endpoint answered with"
         );
         assert!(node_b.server_state.reputations.lock().unwrap().is_empty());
+    }
+
+    /// FAILS ON REVERT (the node taking the first entry it can, the client
+    /// the last): two `[[peers]]` entries for one endpoint gave the node one
+    /// entry's key and the client the other's pin. Only the first counts.
+    #[tokio::test]
+    async fn only_the_first_entry_for_an_endpoint_gives_the_key_and_the_pin() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let (addr_a, sha_a, id_a, _ha) = listening(dir_a.path()).await;
+        let other_key = NodeIdentity::generate().node_id;
+        let other_sha = "ab".repeat(32);
+
+        let dir_b = tempfile::tempdir().unwrap();
+        let node_b = MeshNode::new(
+            loopback_config(vec![
+                pinned(addr_a, &sha_a, &id_a),
+                pinned(addr_a, &other_sha, &other_key),
+            ]),
+            dir_b.path(),
+        )
+        .unwrap();
+        assert_eq!(node_b.peers.len(), 1);
+        assert_eq!(node_b.peers[0].node_id, id_a);
+        assert!(accepts(&node_b, &id_a));
+        assert!(!accepts(&node_b, &other_key));
+        let ping = node_b.client.ping(&node_b.peers[0]).await;
+        assert_eq!(ping.expect("checked the second pin").node_id, id_a);
+
+        // The first entry's key is refused: the second never stands in.
+        let dir_c = tempfile::tempdir().unwrap();
+        let node_c = MeshNode::new(
+            loopback_config(vec![
+                pinned(addr_a, &sha_a, "not-a-key"),
+                pinned(addr_a, &sha_a, &other_key),
+            ]),
+            dir_c.path(),
+        )
+        .unwrap();
+        assert!(node_c.peers.is_empty(), "the second entry stood in");
+        assert!(!accepts(&node_c, &other_key));
     }
 
     /// A configured peer with no way to check its certificate, over plain

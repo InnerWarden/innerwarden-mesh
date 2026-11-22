@@ -125,11 +125,52 @@ pub async fn start_server(
     serve(app, bind, tls).await
 }
 
+/// How long a connection the TLS listener took may stay open for, and how many
+/// it serves at once. Whoever reaches the port can open a connection, finish
+/// the handshake and then send nothing, or headers a byte at a time, or a body
+/// that never ends: each of these holds a task and a socket. So a peer has
+/// [`ConnLimits::handshake`] to finish TLS, [`ConnLimits::header_read`] to send
+/// each request's headers (also the longest an idle keep-alive connection
+/// waits for the next one), and the whole connection ends after
+/// [`ConnLimits::lifetime`] (the request in flight gets [`ConnLimits::grace`]
+/// to finish). At most [`ConnLimits::max_connections`] are served at once; the
+/// next one waits in the kernel's accept queue until one of those ends. A mesh
+/// request is a small JSON body, answered in milliseconds.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConnLimits {
+    pub max_connections: usize,
+    pub handshake: std::time::Duration,
+    pub header_read: std::time::Duration,
+    pub lifetime: std::time::Duration,
+    pub grace: std::time::Duration,
+}
+
+impl Default for ConnLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: 64,
+            handshake: std::time::Duration::from_secs(10),
+            header_read: std::time::Duration::from_secs(10),
+            lifetime: std::time::Duration::from_secs(60),
+            grace: std::time::Duration::from_secs(5),
+        }
+    }
+}
+
 /// Serve `app` on `bind`: over TLS, or plain HTTP on a loopback address only.
 async fn serve(
     app: Router,
     bind: &str,
     tls: Option<Arc<rustls::ServerConfig>>,
+) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    serve_with(app, bind, tls, ConnLimits::default()).await
+}
+
+async fn serve_with(
+    app: Router,
+    bind: &str,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    limits: ConnLimits,
 ) -> anyhow::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let addr = listener.local_addr()?;
@@ -148,11 +189,20 @@ async fn serve(
         });
         return Ok((addr, handle));
     };
-    info!(addr = %addr, "mesh listener started (TLS)");
+    info!(
+        addr = %addr,
+        max_connections = limits.max_connections,
+        "mesh listener started (TLS)"
+    );
 
     let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    let slots = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
     let handle = tokio::spawn(async move {
         loop {
+            // A free slot first: at the cap nothing more is accepted.
+            let Ok(slot) = slots.clone().acquire_owned().await else {
+                return;
+            };
             let (tcp, _) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
@@ -164,16 +214,24 @@ async fn serve(
             let acceptor = acceptor.clone();
             let app = app.clone();
             tokio::spawn(async move {
-                // A peer that never finishes its handshake holds nothing.
-                let handshake =
-                    tokio::time::timeout(std::time::Duration::from_secs(10), acceptor.accept(tcp));
+                let _slot = slot;
+                let handshake = tokio::time::timeout(limits.handshake, acceptor.accept(tcp));
                 let Ok(Ok(stream)) = handshake.await else {
                     return;
                 };
                 let service = hyper_util::service::TowerToHyperService::new(app);
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
-                    .await;
+                let conn = hyper::server::conn::http1::Builder::new()
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    .header_read_timeout(limits.header_read)
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service);
+                tokio::pin!(conn);
+                tokio::select! {
+                    _ = conn.as_mut() => {}
+                    _ = tokio::time::sleep(limits.lifetime) => {
+                        conn.as_mut().graceful_shutdown();
+                        let _ = tokio::time::timeout(limits.grace, conn).await;
+                    }
+                }
             });
         }
     });
@@ -426,10 +484,26 @@ pub struct RefusedPeer {
 impl MeshClient {
     /// A client for `peers`, and the ones it refused (no `https://`, no
     /// certificate pin or CA, an unreadable CA). Never contacted.
+    ///
+    /// Only the first `[[peers]]` entry for an endpoint counts, here and in
+    /// `MeshNode::new`, which takes its `public_key`: a later entry for the
+    /// same endpoint is refused, so the certificate checked and the node id
+    /// taken always come from the same entry. Even when the first is refused,
+    /// a later one never stands in for it.
     pub fn for_peers(peers: &[PeerEntry]) -> (Self, Vec<RefusedPeer>) {
         let mut by_endpoint = HashMap::new();
         let mut refused = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for peer in peers {
+            if !seen.insert(peer.endpoint.as_str()) {
+                refused.push(RefusedPeer {
+                    endpoint: peer.endpoint.clone(),
+                    reason: "another [[peers]] entry names this endpoint first; only the first \
+                             one is used"
+                        .to_string(),
+                });
+                continue;
+            }
             match crate::tls::peer_client(peer, std::time::Duration::from_secs(10)) {
                 Ok(client) => {
                     by_endpoint.insert(peer.endpoint.clone(), client);
@@ -630,6 +704,239 @@ mod tests {
             client.ping(&peer).await.is_none(),
             "another CA's peer was read"
         );
+    }
+
+    /// A certificate signed by the configured CA but for another name is
+    /// refused, with or without a pin beside the CA. A pin alone does not
+    /// read the name: the pin is the identity.
+    #[tokio::test]
+    async fn a_certificate_from_the_right_ca_for_another_name_is_refused() {
+        let ca = testing::ca();
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, &ca.pem).unwrap();
+        let state = test_server_state(&[]);
+        let node_id = state.identity.node_id.clone();
+        let (config, sha) = testing::leaf(&["other.name"], Some(&ca));
+        let (addr, _h) = start_server(state, "127.0.0.1:0", Some(config))
+            .await
+            .unwrap();
+
+        let (client, peer) = client_for(peer_entry(addr, None, ca_path.to_str()));
+        assert!(
+            client.ping(&peer).await.is_none(),
+            "read a certificate made out to another name"
+        );
+        let (client, peer) = client_for(peer_entry(addr, Some(sha), ca_path.to_str()));
+        assert!(
+            client.ping(&peer).await.is_none(),
+            "the pin let a certificate for another name past the CA"
+        );
+        let (client, peer) = client_for(peer_entry(addr, Some(sha), None));
+        assert_eq!(client.ping(&peer).await.unwrap().node_id, node_id);
+    }
+
+    /// FAILS ON REVERT (the CA check skipped when a pin matches): with both a
+    /// pin and a CA, each must hold.
+    #[tokio::test]
+    async fn with_a_pin_and_a_ca_both_must_hold() {
+        let ca = testing::ca();
+        let other_ca = testing::ca();
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, &ca.pem).unwrap();
+        let other_path = dir.path().join("other.pem");
+        std::fs::write(&other_path, &other_ca.pem).unwrap();
+        let state = test_server_state(&[]);
+        let node_id = state.identity.node_id.clone();
+        let (config, sha) = testing::leaf(&["127.0.0.1"], Some(&ca));
+        let (_unused, other_sha) = testing::leaf(&["127.0.0.1"], Some(&ca));
+        let (addr, _h) = start_server(state, "127.0.0.1:0", Some(config))
+            .await
+            .unwrap();
+
+        let (client, peer) = client_for(peer_entry(addr, Some(sha), ca_path.to_str()));
+        assert_eq!(client.ping(&peer).await.unwrap().node_id, node_id);
+        let (client, peer) = client_for(peer_entry(addr, Some(other_sha), ca_path.to_str()));
+        assert!(
+            client.ping(&peer).await.is_none(),
+            "the CA let a certificate past a pin it does not match"
+        );
+        let (client, peer) = client_for(peer_entry(addr, Some(sha), other_path.to_str()));
+        assert!(
+            client.ping(&peer).await.is_none(),
+            "the pin let a certificate past a CA it does not chain to"
+        );
+    }
+
+    /// FAILS ON REVERT (each entry overwriting the one before in the client,
+    /// while the node takes the first entry's key): two `[[peers]]` entries
+    /// for one endpoint, the client checked the last one's pin.
+    #[tokio::test]
+    async fn only_the_first_entry_for_an_endpoint_counts() {
+        let state = test_server_state(&[]);
+        let (addr, real) = tls_server(state).await;
+        let (_other_config, other) = testing::leaf(&["127.0.0.1"], None);
+        let peer = PeerInfo {
+            node_id: String::new(),
+            endpoint: format!("https://{addr}"),
+            label: None,
+            added_at: chrono::Utc::now(),
+        };
+
+        let entries = [
+            peer_entry(addr, Some(real), None),
+            peer_entry(addr, Some(other), None),
+        ];
+        let (client, refused) = MeshClient::for_peers(&entries);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].reason.contains("first"), "{refused:?}");
+        assert!(client.ping(&peer).await.is_some(), "checked the second pin");
+
+        let entries = [
+            peer_entry(addr, Some(other), None),
+            peer_entry(addr, Some(real), None),
+        ];
+        let (client, refused) = MeshClient::for_peers(&entries);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(client.ping(&peer).await.is_none(), "checked the second pin");
+
+        // The first refused (no pin, no CA): a later entry never stands in.
+        let entries = [
+            peer_entry(addr, None, None),
+            peer_entry(addr, Some(real), None),
+        ];
+        let (client, refused) = MeshClient::for_peers(&entries);
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert!(!client.contacts(&peer.endpoint));
+    }
+
+    /// A TLS connection to `addr` that accepts the certificate `sha`.
+    async fn raw_tls(
+        addr: SocketAddr,
+        sha: [u8; 32],
+    ) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+        tokio_rustls::TlsConnector::from(testing::pinned_client(sha))
+            .connect(name, tcp)
+            .await
+    }
+
+    /// Whether the listener closes `stream` within `within`.
+    async fn closed_within<S: tokio::io::AsyncRead + Unpin>(
+        stream: &mut S,
+        within: std::time::Duration,
+    ) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut sink = Vec::new();
+        tokio::time::timeout(within, stream.read_to_end(&mut sink))
+            .await
+            .is_ok()
+    }
+
+    fn short_limits() -> ConnLimits {
+        ConnLimits {
+            max_connections: 8,
+            handshake: std::time::Duration::from_secs(10),
+            header_read: std::time::Duration::from_secs(30),
+            lifetime: std::time::Duration::from_secs(60),
+            grace: std::time::Duration::from_secs(5),
+        }
+    }
+
+    async fn limited_server(limits: ConnLimits) -> (SocketAddr, [u8; 32], String) {
+        let state = test_server_state(&[]);
+        let node_id = state.identity.node_id.clone();
+        let app = Router::new()
+            .route("/mesh/signal", post(handle_signal))
+            .route("/mesh/ping", get(handle_ping))
+            .with_state(state);
+        let (config, sha) = testing::leaf(&["127.0.0.1"], None);
+        let (addr, _h) = serve_with(app, "127.0.0.1:0", Some(config), limits)
+            .await
+            .unwrap();
+        (addr, sha, node_id)
+    }
+
+    /// FAILS ON REVERT (no timer on the HTTP/1 builder, so no header read
+    /// timeout): a connection that finishes TLS and sends nothing is held
+    /// open for as long as its sender likes.
+    #[tokio::test]
+    async fn a_connection_that_sends_no_request_is_closed() {
+        let limits = ConnLimits {
+            header_read: std::time::Duration::from_millis(300),
+            ..short_limits()
+        };
+        let (addr, sha, _) = limited_server(limits).await;
+        let mut silent = raw_tls(addr, sha).await.unwrap();
+        assert!(
+            closed_within(&mut silent, std::time::Duration::from_secs(5)).await,
+            "a silent connection was held open"
+        );
+    }
+
+    /// FAILS ON REVERT (no lifetime on a connection): headers on time and
+    /// then a body that never ends hold the connection, and its slot, forever.
+    #[tokio::test]
+    async fn a_body_that_never_ends_holds_the_connection_no_longer_than_its_lifetime() {
+        use tokio::io::AsyncWriteExt;
+        let limits = ConnLimits {
+            header_read: std::time::Duration::from_millis(300),
+            lifetime: std::time::Duration::from_millis(600),
+            grace: std::time::Duration::from_millis(200),
+            ..short_limits()
+        };
+        let (addr, sha, _) = limited_server(limits).await;
+        let mut slow = raw_tls(addr, sha).await.unwrap();
+        slow.write_all(
+            b"POST /mesh/signal HTTP/1.1\r\nHost: peer\r\nContent-Type: application/json\r\n\
+              Content-Length: 1000\r\n\r\n{",
+        )
+        .await
+        .unwrap();
+        slow.flush().await.unwrap();
+        assert!(
+            closed_within(&mut slow, std::time::Duration::from_secs(5)).await,
+            "a body that never ends held the connection"
+        );
+    }
+
+    /// FAILS ON REVERT (no cap on connections): at the cap, the next
+    /// connection is not even accepted until one being served ends; then it is
+    /// served.
+    #[tokio::test]
+    async fn at_the_cap_the_next_connection_waits_for_a_free_slot() {
+        use tokio::io::AsyncWriteExt;
+        let limits = ConnLimits {
+            max_connections: 1,
+            ..short_limits()
+        };
+        let (addr, sha, node_id) = limited_server(limits).await;
+        let holder = raw_tls(addr, sha).await.unwrap();
+
+        let mut next = Box::pin(raw_tls(addr, sha));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut next)
+                .await
+                .is_err(),
+            "a connection past the cap was served"
+        );
+        drop(holder);
+        let mut next = tokio::time::timeout(std::time::Duration::from_secs(5), next)
+            .await
+            .expect("the freed slot went to the waiting connection")
+            .unwrap();
+        next.write_all(b"GET /mesh/ping HTTP/1.1\r\nHost: peer\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut next, &mut answer)
+            .await
+            .unwrap();
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.contains(&node_id), "{answer}");
     }
 
     /// A peer the client refused (no pin, no CA, plain HTTP) is never

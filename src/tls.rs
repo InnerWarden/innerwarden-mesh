@@ -360,6 +360,24 @@ pub(crate) mod testing {
         let key = PrivateKeyDer::try_from(key.serialize_der()).unwrap();
         (server_config_from(vec![der], key).unwrap(), sha)
     }
+
+    /// A raw TLS client config that accepts exactly the certificate `sha256`,
+    /// for tests that speak to the listener byte by byte.
+    pub fn pinned_client(sha256: [u8; 32]) -> Arc<rustls::ClientConfig> {
+        let provider = provider();
+        Arc::new(
+            rustls::ClientConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(PinnedCert {
+                    sha256,
+                    chain: None,
+                    provider,
+                }))
+                .with_no_client_auth(),
+        )
+    }
 }
 
 #[cfg(test)]
