@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,7 @@ use crate::crypto::NodeIdentity;
 use crate::peer::{PeerInfo, PeerReputation};
 use crate::persistence;
 use crate::signal::ThreatSignal;
-use crate::staging::{StagedAction, StagingPool};
+use crate::staging::StagingPool;
 use crate::transport::{self, MeshClient, MeshServerState};
 use crate::validation::RateLimiter;
 
@@ -61,6 +61,8 @@ pub struct MeshNode {
     notified_blocks: std::collections::HashSet<String>,
     /// Last time we ran peer discovery (for periodic re-discovery).
     last_discovery: chrono::DateTime<Utc>,
+    /// The listener's certificate and key (`tls::listener_cert_paths`).
+    listener_cert: (std::path::PathBuf, std::path::PathBuf),
 }
 
 impl MeshNode {
@@ -79,23 +81,57 @@ impl MeshNode {
             reputations.insert(rep.node_id.clone(), rep);
         }
 
-        // Merge config peers with persisted peers.
-        // Dedup by endpoint (not node_id) because config peers may have empty
-        // public_key — those get resolved later via discover_peers().
-        let mut peers: Vec<PeerInfo> = state.peers;
+        // The peers are the configured ones the client accepted, nothing
+        // else. A peer persisted from an earlier run, or learned over a
+        // connection nobody checked, is not one: its node id is read again,
+        // over its checked certificate, or taken from its `public_key`.
+        let (client, refused) = MeshClient::for_peers(&config.peers);
+        for r in &refused {
+            warn!(endpoint = %r.endpoint, reason = %r.reason, "mesh: peer refused, never contacted");
+        }
+        // Only the first entry for an endpoint counts, as in `for_peers`: its
+        // pin is the one the client checks, so its key is the one taken. A
+        // later entry never stands in, not even when the first is refused.
+        let mut peers: Vec<PeerInfo> = Vec::new();
+        let mut known_peers: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<&str> = HashSet::new();
         for pe in &config.peers {
-            if !peers.iter().any(|p| p.endpoint == pe.endpoint) {
-                peers.push(PeerInfo {
-                    node_id: pe.public_key.clone(),
-                    endpoint: pe.endpoint.clone(),
-                    label: pe.label.clone(),
-                    added_at: Utc::now(),
-                });
+            if !seen.insert(pe.endpoint.as_str()) || !client.contacts(&pe.endpoint) {
+                continue;
             }
+            let key = pe.public_key.trim();
+            if !key.is_empty() {
+                if !NodeIdentity::is_node_id(key) {
+                    warn!(endpoint = %pe.endpoint, "mesh: peer refused, public_key is not an Ed25519 key in hex");
+                    continue;
+                }
+                known_peers.insert(key.to_string());
+            }
+            peers.push(PeerInfo {
+                node_id: key.to_string(),
+                endpoint: pe.endpoint.clone(),
+                label: pe.label.clone(),
+                added_at: Utc::now(),
+            });
+        }
+        drop(state.peers);
+
+        let listener_cert = crate::tls::listener_cert_paths(
+            data_dir,
+            config.tls_cert.as_deref(),
+            config.tls_key.as_deref(),
+        )?;
+        match crate::tls::cert_file_sha256(&listener_cert.0) {
+            Ok(sha) => info!(
+                cert = %listener_cert.0.display(),
+                sha256 = %crate::tls::format_sha256(&sha),
+                "mesh: listener certificate (peers pin this as tls_cert_sha256)"
+            ),
+            Err(e) => warn!(error = %format!("{e:#}"), "mesh: listener certificate unreadable"),
         }
 
         // Restore staging pool
-        let mut staging = StagingPool::new(config.max_staged);
+        let staging = StagingPool::new(config.max_staged);
         // TODO: restore staged entries from persistence
 
         let server_state = Arc::new(MeshServerState {
@@ -104,6 +140,7 @@ impl MeshNode {
             reputations: Arc::new(Mutex::new(reputations)),
             rate_limiter: Arc::new(Mutex::new(RateLimiter::new(config.max_signals_per_hour))),
             suppressions: Arc::new(Mutex::new(Vec::new())),
+            known_peers: Arc::new(Mutex::new(known_peers)),
             config: config.clone(),
         });
 
@@ -111,17 +148,28 @@ impl MeshNode {
             identity,
             peers,
             server_state,
-            client: MeshClient::new(),
+            client,
             config,
             data_dir: data_dir.to_path_buf(),
             notified_blocks: std::collections::HashSet::new(),
             last_discovery: chrono::DateTime::<Utc>::MIN_UTC,
+            listener_cert,
         })
     }
 
-    /// Start the inbound HTTPS listener.
+    /// Start the inbound HTTPS listener, answering with the listener
+    /// certificate (`tls_cert`/`tls_key`, or the node's own pair).
     pub async fn start_listener(&self) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
-        transport::start_server(self.server_state.clone(), &self.config.bind).await
+        let tls = crate::tls::server_config(&self.listener_cert.0, &self.listener_cert.1)?;
+        transport::start_server(self.server_state.clone(), &self.config.bind, Some(tls)).await
+    }
+
+    /// The SHA-256 of the listener's certificate, in openssl's form: what a
+    /// peer sets as `tls_cert_sha256` for this node.
+    pub fn listener_cert_sha256(&self) -> Result<String> {
+        Ok(crate::tls::format_sha256(&crate::tls::cert_file_sha256(
+            &self.listener_cert.0,
+        )?))
     }
 
     /// Discover peer identities by pinging their endpoints.
@@ -133,12 +181,34 @@ impl MeshNode {
         for peer in &self.peers {
             info!(endpoint = %peer.endpoint, "mesh: pinging peer...");
             match self.client.ping(peer).await {
+                // A peer configured with a key that answers as another node
+                // is misconfigured or not the peer: its answer is not taken.
+                Some(resp) if !peer.node_id.is_empty() && resp.node_id != peer.node_id => {
+                    warn!(
+                        endpoint = %peer.endpoint,
+                        answered = %NodeIdentity::short_id(&resp.node_id),
+                        "mesh: peer answered with a node id other than its configured public_key; \
+                         only the configured key is accepted"
+                    );
+                    resolved.push(peer.clone());
+                }
+                Some(resp) if !NodeIdentity::is_node_id(&resp.node_id) => {
+                    warn!(endpoint = %peer.endpoint, "mesh: peer answered with no valid node id");
+                    resolved.push(peer.clone());
+                }
                 Some(resp) => {
                     info!(
                         endpoint = %peer.endpoint,
-                        peer_node_id = &resp.node_id[..16.min(resp.node_id.len())],
+                        peer_node_id = %NodeIdentity::short_id(&resp.node_id),
                         "mesh: peer discovered"
                     );
+                    // Read over the peer's checked certificate: this id is
+                    // the peer's, and its signals are accepted from now on.
+                    self.server_state
+                        .known_peers
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(resp.node_id.clone());
                     // Update peer with real node_id
                     resolved.push(PeerInfo {
                         node_id: resp.node_id.clone(),
@@ -176,17 +246,12 @@ impl MeshNode {
             return;
         }
 
-        // Check if any peers still have empty node_ids (not yet discovered)
+        // Peers whose node id is not known yet (configured without a
+        // `public_key` and not reached since). A refused peer is not in
+        // `self.peers` and is never retried: its configuration has to change.
         let undiscovered = self.peers.iter().any(|p| p.node_id.is_empty());
-        // Also re-discover if we have fewer active peers than configured
-        let fewer_than_config = self.peers.len() < self.config.peers.len();
-
-        if undiscovered || fewer_than_config {
-            info!(
-                undiscovered,
-                fewer_than_config,
-                "mesh: re-running peer discovery"
-            );
+        if undiscovered {
+            info!(undiscovered, "mesh: re-running peer discovery");
             self.discover_peers().await;
         }
     }
@@ -225,7 +290,9 @@ impl MeshNode {
             }
         }
         info!(
-            ip, detector, confidence,
+            ip,
+            detector,
+            confidence,
             peers_notified = sent,
             peers_total = self.peers.len(),
             "mesh: broadcast local block"
@@ -432,7 +499,12 @@ impl MeshNode {
 
     /// Get active block count for dashboard.
     pub fn active_block_count(&self) -> usize {
-        self.server_state.staging.lock().unwrap().active_blocks().len()
+        self.server_state
+            .staging
+            .lock()
+            .unwrap()
+            .active_blocks()
+            .len()
     }
 }
 
@@ -451,6 +523,7 @@ pub struct PeerSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[tokio::test]
     async fn create_node_and_start() {
@@ -500,49 +573,68 @@ mod tests {
         assert!(node.drain_advisory_suppressions().is_empty());
     }
 
+    fn loopback_config(peers: Vec<crate::config::PeerEntry>) -> MeshConfig {
+        MeshConfig {
+            bind: "127.0.0.1:0".to_string(),
+            peers,
+            initial_trust: 0.9,
+            ..MeshConfig::default()
+        }
+    }
+
+    /// A node listening on loopback with no peers: its endpoint, its
+    /// certificate's digest and its node id, as another node configures it.
+    async fn listening(dir: &Path) -> (SocketAddr, String, String, tokio::task::JoinHandle<()>) {
+        let node = MeshNode::new(loopback_config(vec![]), dir).unwrap();
+        let (addr, h) = node.start_listener().await.unwrap();
+        (
+            addr,
+            node.listener_cert_sha256().unwrap(),
+            node.node_id().to_string(),
+            h,
+        )
+    }
+
+    fn pinned(addr: SocketAddr, sha: &str, key: &str) -> crate::config::PeerEntry {
+        crate::config::PeerEntry {
+            endpoint: format!("https://{addr}"),
+            public_key: key.to_string(),
+            label: None,
+            tls_cert_sha256: Some(sha.to_string()),
+            tls_ca: None,
+        }
+    }
+
+    /// Both sides as an operator configures them: A pins B's certificate, B
+    /// names A's key and pins A's certificate. A's block reaches B and B
+    /// stages it.
     #[tokio::test]
     async fn two_nodes_full_flow() {
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
+        let (addr_a, sha_a, id_a, _ha) = listening(dir_a.path()).await;
 
-        // Create Node A
-        let mut cfg_a = MeshConfig::default();
-        cfg_a.bind = "127.0.0.1:0".to_string();
-        let node_a = MeshNode::new(cfg_a, dir_a.path()).unwrap();
-        let (addr_a, _h1) = node_a.start_listener().await.unwrap();
+        let mut node_b = MeshNode::new(
+            loopback_config(vec![pinned(addr_a, &sha_a, &id_a)]),
+            dir_b.path(),
+        )
+        .unwrap();
+        let (addr_b, _hb) = node_b.start_listener().await.unwrap();
+        let sha_b = node_b.listener_cert_sha256().unwrap();
+        // B reads A over A's pinned certificate: A's configured trust.
+        node_b.discover_peers().await;
 
-        // Create Node B
-        let mut cfg_b = MeshConfig::default();
-        cfg_b.bind = "127.0.0.1:0".to_string();
-        let mut node_b = MeshNode::new(cfg_b, dir_b.path()).unwrap();
-        let (addr_b, _h2) = node_b.start_listener().await.unwrap();
-
-        // Give Node B high trust for Node A
-        {
-            let mut reps = node_b.server_state.reputations.lock().unwrap();
-            let mut rep = PeerReputation::new(node_a.identity.node_id.clone());
-            rep.trust_score = 0.9;
-            reps.insert(node_a.identity.node_id.clone(), rep);
-        }
-
-        // Node A broadcasts to Node B
-        let peer_b = PeerInfo {
-            node_id: node_b.identity.node_id.clone(),
-            endpoint: format!("http://{addr_b}"),
-            label: None,
-            added_at: Utc::now(),
-        };
-
-        // Manually send signal (broadcast_local_block uses self.peers which is empty in test)
-        let signal = ThreatSignal::new(
-            &node_a.identity,
-            "9.8.7.6".to_string(),
-            "c2_callback".to_string(),
-            0.92,
-            b"evidence",
-            3600,
-        );
-        assert!(node_a.client.send_signal(&peer_b, &signal).await);
+        // A again (same data dir: same identity and certificate), now with B.
+        let node_a = MeshNode::new(
+            loopback_config(vec![pinned(addr_b, &sha_b, "")]),
+            dir_a.path(),
+        )
+        .unwrap();
+        assert_eq!(node_a.node_id(), id_a);
+        assert_eq!(node_a.peer_count(), 1);
+        node_a
+            .broadcast_local_block("9.8.7.6", "c2_callback", 0.92, b"evidence", 3600)
+            .await;
 
         // Node B ticks — should have a block
         let result = node_b.tick();
@@ -552,9 +644,130 @@ mod tests {
         // Node B confirms locally — trust should increase
         node_b.confirm_local_incident("9.8.7.6");
         let reps = node_b.server_state.reputations.lock().unwrap();
-        let rep = reps.get(&node_a.identity.node_id).unwrap();
+        let rep = reps.get(&id_a).unwrap();
         assert!(rep.trust_score > 0.9); // was 0.9, confirm adds 0.05
         assert_eq!(rep.signals_confirmed, 1);
+    }
+
+    fn accepts(node: &MeshNode, sender: &str) -> bool {
+        node.server_state
+            .known_peers
+            .lock()
+            .unwrap()
+            .contains(sender)
+    }
+
+    /// A peer configured without a key: its id is learned from its ping over
+    /// its pinned certificate, and only then are its signals taken.
+    #[tokio::test]
+    async fn a_peer_without_a_key_is_heard_only_after_its_checked_ping() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let (addr_a, sha_a, id_a, _ha) = listening(dir_a.path()).await;
+        let mut node_b = MeshNode::new(
+            loopback_config(vec![pinned(addr_a, &sha_a, "")]),
+            dir_b.path(),
+        )
+        .unwrap();
+        assert!(!accepts(&node_b, &id_a));
+        node_b.discover_peers().await;
+        assert!(accepts(&node_b, &id_a));
+    }
+
+    /// FAILS ON REVERT (the configured-key check in `discover_peers`): a peer
+    /// configured with one key that answers as another node gets the other
+    /// node's signals accepted.
+    #[tokio::test]
+    async fn a_peer_answering_as_another_node_than_its_key_is_not_taken() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let (addr_a, sha_a, id_a, _ha) = listening(dir_a.path()).await;
+        let configured = NodeIdentity::generate().node_id;
+        let mut node_b = MeshNode::new(
+            loopback_config(vec![pinned(addr_a, &sha_a, &configured)]),
+            dir_b.path(),
+        )
+        .unwrap();
+        node_b.discover_peers().await;
+        assert!(accepts(&node_b, &configured));
+        assert!(
+            !accepts(&node_b, &id_a),
+            "took the id the endpoint answered with"
+        );
+        assert!(node_b.server_state.reputations.lock().unwrap().is_empty());
+    }
+
+    /// FAILS ON REVERT (the node taking the first entry it can, the client
+    /// the last): two `[[peers]]` entries for one endpoint gave the node one
+    /// entry's key and the client the other's pin. Only the first counts.
+    #[tokio::test]
+    async fn only_the_first_entry_for_an_endpoint_gives_the_key_and_the_pin() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let (addr_a, sha_a, id_a, _ha) = listening(dir_a.path()).await;
+        let other_key = NodeIdentity::generate().node_id;
+        let other_sha = "ab".repeat(32);
+
+        let dir_b = tempfile::tempdir().unwrap();
+        let node_b = MeshNode::new(
+            loopback_config(vec![
+                pinned(addr_a, &sha_a, &id_a),
+                pinned(addr_a, &other_sha, &other_key),
+            ]),
+            dir_b.path(),
+        )
+        .unwrap();
+        assert_eq!(node_b.peers.len(), 1);
+        assert_eq!(node_b.peers[0].node_id, id_a);
+        assert!(accepts(&node_b, &id_a));
+        assert!(!accepts(&node_b, &other_key));
+        let ping = node_b.client.ping(&node_b.peers[0]).await;
+        assert_eq!(ping.expect("checked the second pin").node_id, id_a);
+
+        // The first entry's key is refused: the second never stands in.
+        let dir_c = tempfile::tempdir().unwrap();
+        let node_c = MeshNode::new(
+            loopback_config(vec![
+                pinned(addr_a, &sha_a, "not-a-key"),
+                pinned(addr_a, &sha_a, &other_key),
+            ]),
+            dir_c.path(),
+        )
+        .unwrap();
+        assert!(node_c.peers.is_empty(), "the second entry stood in");
+        assert!(!accepts(&node_c, &other_key));
+    }
+
+    /// A configured peer with no way to check its certificate, over plain
+    /// HTTP, or with a key that is not one, is not a peer at all; and a peer
+    /// persisted from an earlier run is never contacted again.
+    #[tokio::test]
+    async fn refused_and_persisted_peers_are_not_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = persistence::MeshState {
+            peers: vec![PeerInfo {
+                node_id: NodeIdentity::generate().node_id,
+                endpoint: "https://203.0.113.9:8790".into(),
+                label: None,
+                added_at: Utc::now(),
+            }],
+            ..Default::default()
+        };
+        persistence::save_state(dir.path(), &state).unwrap();
+        let pin = "ab".repeat(32);
+        let mut no_check = pinned("127.0.0.1:9".parse().unwrap(), &pin, "");
+        no_check.tls_cert_sha256 = None;
+        let mut plain = pinned("127.0.0.1:10".parse().unwrap(), &pin, "");
+        plain.endpoint = "http://127.0.0.1:10".into();
+        let bad_key = pinned("127.0.0.1:11".parse().unwrap(), &pin, "not-a-key");
+        let good = pinned("127.0.0.1:12".parse().unwrap(), &pin, "");
+        let node = MeshNode::new(
+            loopback_config(vec![no_check, plain, bad_key, good]),
+            dir.path(),
+        )
+        .unwrap();
+        let endpoints: Vec<String> = node.peers.iter().map(|p| p.endpoint.clone()).collect();
+        assert_eq!(endpoints, vec!["https://127.0.0.1:12".to_string()]);
+        assert!(node.server_state.known_peers.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

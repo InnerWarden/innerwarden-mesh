@@ -72,10 +72,7 @@ impl StagingPool {
             if weighted_score > existing.weighted_score {
                 existing.weighted_score = weighted_score;
             }
-            if !existing
-                .contributing_peers
-                .contains(&signal.node_id)
-            {
+            if !existing.contributing_peers.contains(&signal.node_id) {
                 existing.contributing_peers.push(signal.node_id.clone());
             }
             // Re-evaluate action with new score
@@ -173,7 +170,7 @@ impl StagingPool {
 
     /// Check if an IP is currently blocked by the mesh.
     pub fn is_blocked(&self, ip: &str) -> bool {
-        self.staged.get(ip).map_or(false, |s| {
+        self.staged.get(ip).is_some_and(|s| {
             matches!(
                 s.action,
                 StagedAction::BlockedShortTtl | StagedAction::BlockedFull
@@ -292,7 +289,10 @@ mod tests {
         let mut pool = StagingPool::new(100);
         let rep1 = make_reputation(0.4); // 0.4 * 0.8 = 0.32 → watchlisted
         pool.ingest(make_signal("1.2.3.4", 0.8), &rep1);
-        assert_eq!(pool.get("1.2.3.4").unwrap().action, StagedAction::Watchlisted);
+        assert_eq!(
+            pool.get("1.2.3.4").unwrap().action,
+            StagedAction::Watchlisted
+        );
 
         // Second peer with higher trust: 0.85 * 0.9 = 0.765 → blocked short TTL
         let rep2 = make_reputation(0.85);

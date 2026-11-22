@@ -36,19 +36,40 @@ pub struct MeshConfig {
     /// are immediately actionable without needing confirmation history.
     #[serde(default = "default_initial_trust")]
     pub initial_trust: f32,
+
+    /// PEM certificate the listener answers with. With `tls_key`; both
+    /// absent, the node makes and keeps a self-signed pair in its data
+    /// directory (`tls::listener_cert_paths`), whose SHA-256 its peers pin.
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+
+    /// PEM private key for `tls_cert`.
+    #[serde(default)]
+    pub tls_key: Option<String>,
 }
 
 /// A peer entry in the config file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerEntry {
-    /// HTTPS endpoint (e.g., "https://10.0.1.5:8790")
+    /// HTTPS endpoint (e.g., "https://10.0.1.5:8790"). An `http://` endpoint
+    /// is refused: it has no certificate to check.
     pub endpoint: String,
-    /// Ed25519 public key hex (64 chars) — verifies this peer's identity.
-    /// Leave empty to auto-discover via ping.
+    /// Ed25519 public key hex (64 chars): the only node id whose signals
+    /// this node accepts for this peer. Empty: learned from the peer's ping,
+    /// over the connection its certificate was checked on.
     pub public_key: String,
     /// Human-friendly label (optional)
     #[serde(default)]
     pub label: Option<String>,
+    /// SHA-256 of the certificate the peer answers with (64 hex digits,
+    /// colons allowed: `openssl x509 -noout -fingerprint -sha256`).
+    #[serde(default)]
+    pub tls_cert_sha256: Option<String>,
+    /// PEM file of the CA the peer's certificate must chain to, for the
+    /// endpoint's name. A peer with neither this nor `tls_cert_sha256` is
+    /// refused (`tls::peer_client`).
+    #[serde(default)]
+    pub tls_ca: Option<String>,
 }
 
 impl Default for MeshConfig {
@@ -62,6 +83,8 @@ impl Default for MeshConfig {
             max_signals_per_hour: default_max_signals_per_hour(),
             max_staged: default_max_staged(),
             initial_trust: default_initial_trust(),
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -114,9 +137,12 @@ mod tests {
             public_key = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
             label = "prod-eu"
 
+            tls_cert_sha256 = "AB:CD"
+
             [[peers]]
             endpoint = "https://10.0.2.5:8790"
             public_key = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+            tls_ca = "/etc/innerwarden/mesh-ca.pem"
         "#;
         let cfg: MeshConfig = toml::from_str(toml).unwrap();
         assert!(cfg.enabled);
@@ -124,6 +150,13 @@ mod tests {
         assert_eq!(cfg.peers.len(), 2);
         assert_eq!(cfg.peers[0].label.as_deref(), Some("prod-eu"));
         assert!(cfg.peers[1].label.is_none());
+        assert_eq!(cfg.peers[0].tls_cert_sha256.as_deref(), Some("AB:CD"));
+        assert!(cfg.peers[0].tls_ca.is_none());
+        assert_eq!(
+            cfg.peers[1].tls_ca.as_deref(),
+            Some("/etc/innerwarden/mesh-ca.pem")
+        );
+        assert!(cfg.tls_cert.is_none() && cfg.tls_key.is_none());
         assert!(!cfg.auto_broadcast);
         assert_eq!(cfg.max_signals_per_hour, 100);
     }

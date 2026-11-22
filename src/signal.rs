@@ -275,13 +275,8 @@ mod tests {
     #[test]
     fn suppression_tampered_dismissals_fails_verification() {
         let id = NodeIdentity::generate();
-        let mut s = SuppressionSignal::new(
-            &id,
-            "web_scan".to_string(),
-            "9.9.9.9".to_string(),
-            5,
-            3600,
-        );
+        let mut s =
+            SuppressionSignal::new(&id, "web_scan".to_string(), "9.9.9.9".to_string(), 5, 3600);
         s.dismissals = 9999; // tamper: inflate corroboration
         assert!(!s.verify_signature());
     }
@@ -289,13 +284,8 @@ mod tests {
     #[test]
     fn suppression_serialization_roundtrip() {
         let id = NodeIdentity::generate();
-        let s = SuppressionSignal::new(
-            &id,
-            "nmap_scan".to_string(),
-            "8.8.8.8".to_string(),
-            7,
-            7200,
-        );
+        let s =
+            SuppressionSignal::new(&id, "nmap_scan".to_string(), "8.8.8.8".to_string(), 7, 7200);
         let json = serde_json::to_string(&s).unwrap();
         let back: SuppressionSignal = serde_json::from_str(&json).unwrap();
         assert!(back.verify_signature());
